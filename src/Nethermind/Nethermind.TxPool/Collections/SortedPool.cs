@@ -173,7 +173,7 @@ namespace Nethermind.TxPool.Collections
         /// <param name="bucket">Bucket for same sender transactions.</param>
         /// <returns>If element was removed. False if element was not present in pool.</returns>
         [MethodImpl(MethodImplOptions.Synchronized)]
-        public bool TryRemove(TKey key, out TValue? value, [NotNullWhen(true)] out ICollection<TValue>? bucket) =>
+        private bool TryRemove(TKey key, out TValue? value, [NotNullWhen(true)] out ICollection<TValue>? bucket) =>
             TryRemove(key, false, out value, out bucket);
 
         private bool TryRemove(TKey key, bool evicted, [NotNullWhen(true)] out TValue? value, out ICollection<TValue>? bucket)
@@ -253,6 +253,17 @@ namespace Nethermind.TxPool.Collections
                 return list ?? Enumerable.Empty<TValue>();
             }
             return Enumerable.Empty<TValue>();
+        }
+
+        /// <summary>
+        /// Checks if element is present.
+        /// </summary>
+        /// <param name="key">Key to check presence.</param>
+        /// <returns>True if element is present in pool.</returns>
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        protected bool ContainsValue(TKey key)
+        {
+            return _cacheMap.ContainsKey(key);
         }
 
         /// <summary>
@@ -390,6 +401,9 @@ namespace Nethermind.TxPool.Collections
         private void UpdateIsFull() =>
             _isFull = _cacheMap.Count >= _capacity;
 
+        [MethodImpl(MethodImplOptions.Synchronized)]
+        public bool ContainsBucket(TGroupKey groupKey) =>
+            _buckets.ContainsKey(groupKey);
 
         [MethodImpl(MethodImplOptions.Synchronized)]
         public bool TryGetBucket(TGroupKey groupKey, out TValue[] items)
