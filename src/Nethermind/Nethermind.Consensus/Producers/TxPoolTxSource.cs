@@ -53,15 +53,65 @@ namespace Nethermind.Consensus.Producers
                 .ThenBy(ByHashTxComparer.Instance); // in order to sort properly and not lose transactions we need to differentiate on their identity which provided comparer might not be doing
 
             IEnumerable<Transaction> transactions = GetOrderedTransactions(pendingTransactions, comparer);
+            IEnumerable<Transaction> blobTransactions = _transactionPool.GetPendingBlobTransactions();
             if (_logger.IsDebug) _logger.Debug($"Collecting pending transactions at block gas limit {gasLimit}.");
 
             int selectedTransactions = 0;
             int i = 0;
-
-            // TODO: removing transactions from TX pool here seems to be a bad practice since they will
-            // not come back if the block is ignored?
             int blobsCounter = 0;
             UInt256 blobGasPrice = UInt256.Zero;
+            List<Transaction>? selectedBlobTxs = null;
+
+            foreach (Transaction blobTx in blobTransactions)
+            {
+                if (BlobGasCalculator.CalculateBlobGas(blobsCounter) == Eip4844Constants.MaxBlobGasPerBlock)
+                {
+                    if (_logger.IsTrace) _logger.Trace($"Declining {blobTx.ToShortString()}, no more blob space. Block already have {blobsCounter} which is max value allowed.");
+                    break;
+                }
+
+                i++;
+
+                bool success = _txFilterPipeline.Execute(blobTx, parent);
+                if (!success) continue;
+
+                if (blobGasPrice.IsZero)
+                {
+                    ulong? excessDataGas = BlobGasCalculator.CalculateExcessBlobGas(parent, _specProvider.GetSpec(parent));
+                    if (excessDataGas is null)
+                    {
+                        if (_logger.IsTrace) _logger.Trace($"Declining {blobTx.ToShortString()}, the specification is not configured to handle shard blob transactions.");
+                        continue;
+                    }
+                    if (!BlobGasCalculator.TryCalculateBlobGasPricePerUnit(excessDataGas.Value, out blobGasPrice))
+                    {
+                        if (_logger.IsTrace) _logger.Trace($"Declining {blobTx.ToShortString()}, failed to calculate data gas price.");
+                        continue;
+                    }
+                }
+
+                int txAmountOfBlobs = blobTx.BlobVersionedHashes?.Length ?? 0;
+
+                if (blobGasPrice > blobTx.MaxFeePerBlobGas)
+                {
+                    if (_logger.IsTrace) _logger.Trace($"Declining {blobTx.ToShortString()}, data gas fee is too low.");
+                    continue;
+                }
+
+                if (BlobGasCalculator.CalculateBlobGas(blobsCounter + txAmountOfBlobs) >
+                    Eip4844Constants.MaxBlobGasPerBlock)
+                {
+                    if (_logger.IsTrace) _logger.Trace($"Declining {blobTx.ToShortString()}, not enough blob space.");
+                    continue;
+                }
+
+                blobsCounter += txAmountOfBlobs;
+                if (_logger.IsTrace) _logger.Trace($"Selected shard blob tx {blobTx.ToShortString()} to be potentially included in block, total blobs included: {blobsCounter}.");
+
+                selectedTransactions++;
+                selectedBlobTxs ??= new List<Transaction>((int)(Eip4844Constants.MaxBlobGasPerBlock / Eip4844Constants.BlobGasPerBlob));
+                selectedBlobTxs.Add(blobTx);
+            }
 
             foreach (Transaction tx in transactions)
             {
@@ -77,49 +127,30 @@ namespace Nethermind.Consensus.Producers
                 bool success = _txFilterPipeline.Execute(tx, parent);
                 if (!success) continue;
 
-                if (tx.SupportsBlobs)
+                if (_logger.IsTrace) _logger.Trace($"Selected {tx.ToShortString()} to be potentially included in block.");
+
+                if (selectedBlobTxs?.Count > 0)
                 {
-                    if (blobGasPrice.IsZero)
+                    foreach (Transaction blobTx in new List<Transaction>(selectedBlobTxs))
                     {
-                        ulong? excessBlobGas = BlobGasCalculator.CalculateExcessBlobGas(parent, _specProvider.GetSpec(parent));
-                        if (excessBlobGas is null)
+                        if (comparer.Compare(blobTx, tx) > 0)
                         {
-                            if (_logger.IsTrace) _logger.Trace($"Declining {tx.ToShortString()}, the specification is not configured to handle shard blob transactions.");
-                            continue;
-                        }
-                        if (!BlobGasCalculator.TryCalculateBlobGasPricePerUnit(excessBlobGas.Value, out blobGasPrice))
-                        {
-                            if (_logger.IsTrace) _logger.Trace($"Declining {tx.ToShortString()}, failed to calculate blob gas price.");
-                            continue;
+                            yield return blobTx;
+                            selectedBlobTxs.Remove(blobTx);
                         }
                     }
-
-                    int txAmountOfBlobs = tx.BlobVersionedHashes?.Length ?? 0;
-
-                    if (blobGasPrice > tx.MaxFeePerBlobGas)
-                    {
-                        if (_logger.IsTrace) _logger.Trace($"Declining {tx.ToShortString()}, blob gas fee is too low.");
-                        continue;
-                    }
-
-                    if (BlobGasCalculator.CalculateBlobGas(blobsCounter + txAmountOfBlobs) >
-                        Eip4844Constants.MaxBlobGasPerBlock)
-                    {
-                        if (_logger.IsTrace) _logger.Trace($"Declining {tx.ToShortString()}, no more blob space.");
-                        continue;
-                    }
-
-                    blobsCounter += txAmountOfBlobs;
-                    if (_logger.IsTrace) _logger.Trace($"Selected shard blob tx {tx.ToShortString()} to be potentially included in block, total blobs included: {blobsCounter}.");
-                }
-                else
-                {
-                    if (_logger.IsTrace)
-                        _logger.Trace($"Selected {tx.ToShortString()} to be potentially included in block.");
                 }
 
                 selectedTransactions++;
                 yield return tx;
+            }
+
+            if (selectedBlobTxs?.Count > 0)
+            {
+                foreach (Transaction blobTx in selectedBlobTxs)
+                {
+                    yield return blobTx;
+                }
             }
 
             if (_logger.IsDebug) _logger.Debug($"Potentially selected {selectedTransactions} out of {i} pending transactions checked.");
